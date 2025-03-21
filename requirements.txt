@@ -1,5 +1,7 @@
 streamlit
-pandas
-plotly
 requests
+pandas
+numpy
+plotly
 openai
+scipy
