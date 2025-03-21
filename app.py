@@ -1,133 +1,77 @@
 import streamlit as st
 import pandas as pd
 import requests
-import numpy as np
-import plotly.graph_objects as go
-import datetime
-import openai
-from scipy.signal import find_peaks
+from datetime import date
+from openai import OpenAI
 
-# Load secrets
+# Load API keys
 polygon_api_key = st.secrets["POLYGON_API_KEY"]
-openai.api_key = st.secrets["OPENAI_API_KEY"]
+openai_api_key = st.secrets["OPENAI_API_KEY"]
+client = OpenAI(api_key=openai_api_key)
 
-# ------------------------ Data Fetching ------------------------
-@st.cache_data(ttl=900)
-def fetch_polygon_data(ticker, timespan="day", limit=200):
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/{timespan}/2023-01-01/{datetime.date.today()}?adjusted=true&sort=asc&limit={limit}&apiKey={polygon_api_key}"
-    r = requests.get(url)
-    data = r.json()
-    if "results" not in data:
-        st.error("Error fetching data from Polygon.")
-        return pd.DataFrame()
-    df = pd.DataFrame(data["results"])
-    df["Date"] = pd.to_datetime(df["t"], unit="ms")
-    df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"}, inplace=True)
-    return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+# Full ticker list from your dataset
+TICKERS = [
+    'AAPL', 'ABBV', 'ACIW', 'ADMA', 'AMD', 'AMZN', 'APD', 'AVGO', 'AXP', 'AXTI',
+    'BA', 'BAC', 'BCPC', 'BHP', 'BMY', 'BZH', 'C', 'CADE', 'CALX', 'CAT', 'COP',
+    'CORT', 'COST', 'CRM', 'CRUS', 'CSX', 'CVX', 'D', 'DE', 'DUK', 'ELV', 'ENB',
+    'ENSG', 'EOG', 'EXC', 'FCX', 'FDX', 'FWRD', 'GE', 'GEF', 'GOOGL', 'GS',
+    'GSHD', 'HAL', 'HD', 'HON', 'ICFI', 'ISRG', 'JNJ', 'JPM', 'KO', 'KOP',
+    'LANC', 'LLY', 'LMT', 'LOW', 'MA', 'MAR', 'MATX', 'MCD', 'META', 'MPC',
+    'MRNA', 'MS', 'MSFT', 'NEE', 'NEM', 'NKE', 'NOC', 'NVDA', 'ORCL', 'OSIS',
+    'OXY', 'PEP', 'PFE', 'PG', 'PRDO', 'RCL', 'RIO', 'SAIA', 'SBUX', 'SCHW',
+    'SLB', 'SO', 'STAA', 'TGT', 'TMO', 'TSLA', 'UNH', 'UPS', 'V', 'VCEL', 'VLO',
+    'WFC', 'WIRE', 'WMT', 'XOM'
+]
 
-# ------------------------ Pattern Detection ------------------------
-def detect_double_bottom(df, threshold=0.02):
-    patterns = []
-    closes = df["Close"].values
-    lows = df["Low"].values
+# Simple double bottom detector
+def detect_double_bottom(df):
+    recent = df.tail(20)
+    lows = recent['l'].values
+    troughs = [i for i in range(1, len(lows)-1) if lows[i] < lows[i-1] and lows[i] < lows[i+1]]
+    if len(troughs) >= 2:
+        t1, t2 = lows[troughs[-2]], lows[troughs[-1]]
+        return abs(t1 - t2) / t1 < 0.03
+    return False
 
-    peaks, _ = find_peaks(-lows, distance=5)
-    for i in range(len(peaks) - 1):
-        first = peaks[i]
-        second = peaks[i + 1]
-        if abs(lows[first] - lows[second]) / closes[second] < threshold:
-            trough_mid = df.iloc[first:second]["High"].max()
-            if trough_mid > lows[first] * (1 + threshold):
-                patterns.append((df["Date"].iloc[second], "Double Bottom"))
-    return patterns
+# Fetch data from Polygon
+def fetch_eod_data(ticker):
+    end = str(date.today())
+    start = "2024-01-01"
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&sort=asc&limit=120&apiKey={polygon_api_key}"
+    res = requests.get(url)
+    if res.status_code == 200 and "results" in res.json():
+        return pd.DataFrame(res.json()["results"])
+    return pd.DataFrame()
 
-def detect_head_shoulders(df):
-    patterns = []
-    closes = df["Close"].values
-    peaks, _ = find_peaks(closes, distance=5)
-    for i in range(1, len(peaks)-1):
-        L, H, R = peaks[i-1], peaks[i], peaks[i+1]
-        if closes[H] > closes[L] and closes[H] > closes[R] and abs(closes[L] - closes[R]) / closes[H] < 0.03:
-            patterns.append((df["Date"].iloc[R], "Head & Shoulders"))
-    return patterns
-
-# ------------------------ Support/Resistance + Volume Filter ------------------------
-def confirm_with_volume_sr(df, patterns):
-    confirmed = []
-    for date, pattern in patterns:
-        idx = df.index[df["Date"] == date]
-        if len(idx) == 0:
-            continue
-        idx = idx[0]
-        if idx < 3 or idx + 3 >= len(df):
-            continue
-        local_volume = df.iloc[idx - 3:idx + 3]["Volume"].mean()
-        curr_volume = df.iloc[idx]["Volume"]
-        resistance = df["Close"].iloc[:idx].max()
-        support = df["Close"].iloc[:idx].min()
-        curr_price = df["Close"].iloc[idx]
-
-        # Confirm pattern with volume spike and proximity to support/resistance
-        if curr_volume > 1.2 * local_volume and (
-            abs(curr_price - support) / support < 0.03 or abs(curr_price - resistance) / resistance < 0.03
-        ):
-            confirmed.append((date, pattern))
-    return confirmed
-
-# ------------------------ OpenAI Interpretation ------------------------
-def interpret_pattern(ticker, patterns):
-    if not patterns:
-        return "No significant chart patterns detected recently."
-
-    prompt = f"Analyze the following technical chart patterns for {ticker}:\n"
-    for date, pattern in patterns:
-        prompt += f"- {pattern} detected on {date.strftime('%Y-%m-%d')}\n"
-    prompt += "\nWhat do these patterns imply about the stock's future movement?"
-
-    response = openai.ChatCompletion.create(
+# Interpret via OpenAI
+def interpret_summary(findings):
+    prompt = (
+        f"Here are today's double bottom pattern scan results:\n\n{findings}\n\n"
+        "Write a concise summary report. Highlight notable patterns, recurring sectors or tickers, and whether the market may be experiencing a potential shift based on the patterns. Keep it practical and insight-driven."
+    )
+    response = client.chat.completions.create(
         model="gpt-4",
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7
     )
     return response.choices[0].message.content.strip()
 
-# ------------------------ Plotting ------------------------
-def plot_chart(df, patterns):
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=df["Date"],
-        open=df["Open"],
-        high=df["High"],
-        low=df["Low"],
-        close=df["Close"],
-        name="Candlestick"
-    ))
+# Streamlit UI
+st.title("📈 EOD Chart Pattern Scanner")
+if st.button("🚨 Scan Now"):
+    st.info("Scanning all tickers... this may take a minute ⏳")
+    results = []
+    for ticker in TICKERS:
+        df = fetch_eod_data(ticker)
+        if not df.empty and detect_double_bottom(df):
+            results.append(ticker)
 
-    for date, pattern in patterns:
-        fig.add_shape(type="line", x0=date, x1=date,
-                      y0=df["Low"].min(), y1=df["High"].max(),
-                      line=dict(color="Red", dash="dot"))
-        fig.add_annotation(x=date, y=df["High"].max(),
-                           text=pattern, showarrow=True, arrowhead=1)
-    fig.update_layout(title="Price Chart with Detected Patterns", xaxis_title="Date", yaxis_title="Price")
-    return fig
-
-# ------------------------ Streamlit UI ------------------------
-st.title("📈 Chart Pattern Detection Dashboard")
-ticker = st.text_input("Enter stock ticker (e.g., AAPL, MSFT)", "AAPL").upper()
-
-if st.button("Run Analysis"):
-    with st.spinner("Fetching and analyzing data..."):
-        df = fetch_polygon_data(ticker)
-        if df.empty:
-            st.warning("No data returned.")
-        else:
-            double_bottoms = detect_double_bottom(df)
-            head_shoulders = detect_head_shoulders(df)
-            all_patterns = double_bottoms + head_shoulders
-            confirmed_patterns = confirm_with_volume_sr(df, all_patterns)
-
-            st.plotly_chart(plot_chart(df, confirmed_patterns), use_container_width=True)
-            interpretation = interpret_pattern(ticker, confirmed_patterns)
-            st.subheader("🧠 Interpretation (OpenAI GPT-4)")
-            st.markdown(interpretation)
+    if results:
+        joined = ", ".join(results)
+        st.success(f"Patterns detected in: {joined}")
+        interpretation = interpret_summary(joined)
+        st.markdown("### 🧠 AI Summary")
+        st.write(interpretation)
+    else:
+        st.warning("No double bottom patterns found today.")
 
